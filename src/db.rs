@@ -122,15 +122,18 @@ pub async fn insert_job(pool: &SqlitePool, image: &str) -> Result<String, sqlx::
 pub async fn update_job_status(
     pool: &SqlitePool,
     id: &str,
-    status: &str,
-    result: Option<&str>,
+    status: &str,         // "queued" | "running" | "completed" | "failed"
+    result: Option<&str>, // optional summary/logs
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         UPDATE jobs
            SET status = ?,
                result = COALESCE(?, result),
-               finished_at = CASE WHEN ? IN ('completed', 'failed') THEN datetime('now') ELSE finished_at END
+               finished_at = CASE WHEN ? IN ('completed', 'failed')
+                                  THEN datetime('now')
+                                  ELSE finished_at
+                             END
          WHERE id = ?
         "#
     )
@@ -151,13 +154,13 @@ pub async fn update_job_result(
     duration_ms: Option<i64>,
     error_message: Option<String>,
 ) -> sqlx::Result<()> {
-    let status = if success { "success" } else { "failed" };
+    let status = if success { "completed" } else { "failed" };
     let finished_at = chrono::Utc::now().timestamp();
     let last_update_ts = finished_at;
 
     sqlx::query(
         r#"
-        UPDATE pull_jobs
+        UPDATE jobs
         SET status = ?, finished_at = ?, duration_ms = ?, bytes = ?, error_message = ?, last_update_ts = ?
         WHERE id = ?
         "#
@@ -181,12 +184,35 @@ pub async fn set_job_error(
     pool: &SqlitePool,
     id: &str,
     error_detail: &str,
+    mark_failed: bool, // true ถ้าต้องการเปลี่ยนเป็น failed พร้อมปิดงาน
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE jobs SET error_detail = ?, status = 'failed', finished_at = datetime('now') WHERE id = ?")
+    if mark_failed {
+        sqlx::query(
+            r#"
+            UPDATE jobs
+               SET status = 'failed',
+                   error_detail = ?,
+                   finished_at = datetime('now')
+             WHERE id = ?
+            "#
+        )
         .bind(error_detail)
         .bind(id)
         .execute(pool)
         .await?;
+    } else {
+        sqlx::query(
+            r#"
+            UPDATE jobs
+               SET error_detail = ?
+             WHERE id = ?
+            "#
+        )
+        .bind(error_detail)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    }
     Ok(())
 }
 
