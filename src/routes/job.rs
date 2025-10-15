@@ -52,6 +52,57 @@ async fn create_job(
 }
 
 
+// Parse image reference into (registry_host, repo, tag).
+// Rules:
+// - If no '/', default registry is docker.io.
+// - If first path segment contains '.' or ':' or equals 'localhost' AND there is at least one '/': treat it as registry.
+// - If no tag provided, default to 'latest'.
+// - For docker.io with single-segment images, prefix 'library/' for canonical repo name (optional for pulling, good for labels).
+fn parse_image_ref(input: &str) -> (String, String, String) {
+    let s = input.trim();
+    // Separate tag using the last ':', but only in the path part (no '/': then it's tag, not host)
+    // First, split by '/', decide registry presence.
+    let mut host = "docker.io".to_string();
+    let mut remainder = s.to_string();
+
+    if let Some(pos) = s.find('/') {
+        let first = &s[..pos];
+        let rest = &s[pos + 1..];
+        if first.contains('.') || first.contains(':') || first == "localhost" {
+            host = first.to_string();
+            remainder = rest.to_string();
+        }
+    }
+
+    // Extract tag from remainder (repo[:tag])
+    let (mut repo, tag) = if let Some((r, t)) = remainder.rsplit_once(':') {
+        (r.to_string(), t.to_string())
+    } else {
+        (remainder, "latest".to_string())
+    };
+
+    // Canonicalize docker.io single-segment -> library/<name>
+    if host == "docker.io" && !repo.contains('/') {
+        repo = format!("library/{}", repo);
+    }
+
+    (host, repo, tag)
+}
+
+// Build the string for CreateImageOptions.from_image.
+// For docker.io we can pass "repo" only (Docker daemon will resolve), but including host also works.
+// To keep compatibility with your current behavior, only prefix host when non-docker.io.
+fn build_from_image(host: &str, repo: &str) -> String {
+    if host == "docker.io" {
+        // return canonical name without host for compatibility
+        // strip "library/" in display? for pulling it's fine either way
+        repo.to_string()
+    } else {
+        format!("{}/{}", host, repo)
+    }
+}
+
+
 // Make it public and take &SqlitePool so runner can call it.
 pub async fn pull_image_and_record_metrics(
     pool: &SqlitePool,
@@ -62,12 +113,9 @@ pub async fn pull_image_and_record_metrics(
     let docker = Docker::connect_with_unix_defaults()
         .map_err(|e| anyhow::anyhow!("docker connect error: {e}"))?;
 
-    let registry_host = image
-        .split('/')
-        .next()
-        .filter(|h| h.contains('.') || h.contains(':'))
-        .unwrap_or("docker.io")
-        .to_string();
+    let (registry_host, repo, _tag) = parse_image_ref(image);
+
+    let from_image = build_from_image(&registry_host, &repo);
 
     let started = Instant::now();
 
@@ -77,16 +125,19 @@ pub async fn pull_image_and_record_metrics(
         (image.to_string(), "latest".to_string())
     };
 
-    let full_ref = format!("{}:{}", repo, tag);
+    let full_ref_with_host = format!("{}/{}:{}", registry_host, repo, tag);
+    let full_ref_repo_tag  = format!("{}:{}", repo, tag);
 
-    remove_image_if_exists(&docker, &full_ref).await;
+    remove_image_if_exists(&docker, &full_ref_with_host).await;
+    remove_image_if_exists(&docker, &full_ref_repo_tag).await;
 
     let opts = CreateImageOptions {
-        from_image: Some(repo),
-        tag: Some(tag),
+        from_image: Some(from_image.clone()),
+        tag: Some(tag.clone()),
         ..Default::default()
     };
 
+    let mut first_byte_at: Option<Instant> = None;
     let mut stream = docker.create_image(Some(opts), None, None);
 
     let mut layers: HashMap<String, (u64, u64)> = HashMap::new();
@@ -110,6 +161,10 @@ pub async fn pull_image_and_record_metrics(
         if let (Some(id), Some(detail)) = (item.id, item.progress_detail) {
             let cur_u64 = detail.current.unwrap_or(0).max(0) as u64;
             let tot_u64 = detail.total.unwrap_or(0).max(0) as u64;
+
+            if first_byte_at.is_none() && cur_u64 > 0 {
+                first_byte_at = Some(Instant::now());
+            }
 
             let entry = layers.entry(id).or_insert((0, 0));
             if cur_u64 > entry.0 {
@@ -149,6 +204,14 @@ pub async fn pull_image_and_record_metrics(
         bytes_downloaded as f64
     };
 
+    // Time to first byte in ms (or 0 if never started downloading)
+    let download_elapsed_ms = if let Some(t0) = first_byte_at {
+        let ms = t0.elapsed().as_millis() as f64;
+        ms
+    } else {
+        0.0
+    };
+
     // Average speed in Mbps (only when real download happened)
     let avg_speed_mbps = if bytes_downloaded > 0 && elapsed_ms > 0.0 {
         ((bytes_downloaded as f64) * 8.0) / (elapsed_ms / 1000.0) / 1_000_000.0
@@ -161,15 +224,17 @@ pub async fn pull_image_and_record_metrics(
     db::insert_metric(pool, job_id, "image_size_bytes", image_size_bytes, Some("bytes")).await?;
     db::insert_metric(pool, job_id, "bytes_downloaded_total", bytes_downloaded as f64, Some("bytes")).await?;
     db::insert_metric(pool, job_id, "image_size_reported_bytes", inspected_size_bytes, Some("bytes")).await?;
+    db::insert_metric(pool, job_id, "download_time_ms_actual", download_elapsed_ms, Some("ms")).await?;
     db::insert_metric(pool, job_id, "average_speed_mbps", avg_speed_mbps, Some("Mbps")).await?;
     db::insert_metric(pool, job_id, "cache_hit", if cache_hit {1.0} else {0.0}, None).await?;
 
     // Labels for layers observed (fix registry_host/image formatting)
     let labels = serde_json::json!({
-        "image": image,
+        "image": format!("{}:{}", repo, tag),
         "registry_host": registry_host,
         "layer_count": layers.len(),
     }).to_string();
+
 
     db::insert_metric_labeled(pool, job_id, "layers_observed", layers.len() as f64, None, Some(&labels)).await?;
 
