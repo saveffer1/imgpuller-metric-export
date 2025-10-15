@@ -5,18 +5,36 @@ mod error;
 mod routes;
 mod worker;
 
+use std::{collections::HashMap, sync::Arc};
 use actix_web::{get, web, App, HttpResponse, HttpServer, Responder};
 use actix_web::middleware::{Logger, NormalizePath, TrailingSlash};
+use tokio::sync::{Mutex, Semaphore};
 use clap::Parser;
 use config::AppConfig;
 use db::init_pool;
 use log::info;
 
+#[derive(Clone)]
+pub struct AppState {
+    pub config: AppConfig,
+    pub global_pull_sem: Arc<Semaphore>,
+    pub registry_sems: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+}
 #[derive(Parser, Debug)]
 #[command(name = "imgpuller-metric-export", version, about = "Actix + SQLx metric exporter")]
 struct CliArgs {
     #[arg(long)]
     init_db: bool,
+}
+
+impl AppState {
+    pub async fn registry_sem(&self, registry: &str) -> Arc<Semaphore> {
+        let mut map = self.registry_sems.lock().await;
+        Arc::clone(
+            map.entry(registry.to_string())
+               .or_insert_with(|| Arc::new(Semaphore::new(self.config.per_registry_max)))
+        )
+    }
 }
 
 #[get("/health")]
@@ -50,6 +68,12 @@ async fn not_found() -> impl Responder {
 async fn main() -> std::io::Result<()> {
     let args = CliArgs::parse();
     let cfg = AppConfig::from_env();
+
+    let app_state = AppState {
+        global_pull_sem: Arc::new(Semaphore::new(cfg.max_concurrent_pulls)),
+        registry_sems: Arc::new(Mutex::new(HashMap::new())),
+        config: cfg.clone(),
+    };
 
     if args.init_db {
         if let Some(path_str) = cfg.database_url.strip_prefix("sqlite://") {
@@ -86,9 +110,14 @@ async fn main() -> std::io::Result<()> {
         .expect("❌ Failed to initialize database");
 
     let runner_pool = pool.clone();
-    tokio::spawn(async move {
-        // concurrency=2, lease_secs=300 (ปรับได้จาก config/env)
-        worker::run_job_runner(runner_pool, 2, 300).await;
+        tokio::spawn(async move {
+        worker::run_job_runner(
+            runner_pool,                  // database pool
+            cfg.max_concurrent_pulls,     // global semaphore
+            cfg.per_registry_max,         // per registry semaphore
+            300,                          // lease time in seconds
+        )
+        .await;
     });
 
     let addr = format!("0.0.0.0:{}", cfg.app_port);
@@ -100,6 +129,7 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .wrap(NormalizePath::new(TrailingSlash::Trim))
             .wrap(Logger::default())
+            .app_data(web::Data::new(app_state.clone()))
             .app_data(web::Data::new(pool.clone()))
             .app_data(
                 web::JsonConfig::default()

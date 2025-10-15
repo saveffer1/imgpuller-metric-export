@@ -11,6 +11,12 @@ pub struct AppConfig {
 
     #[validate(custom(function = "validate_db_url"))]
     pub database_url: String,
+
+    #[validate(range(min = 1, max = 10))]
+    pub max_concurrent_pulls: usize,
+
+    #[validate(range(min = 1, max = 10))]
+    pub per_registry_max: usize,
 }
 
 fn validate_db_url(url: &str) -> Result<(), ValidationError> {
@@ -22,7 +28,6 @@ fn validate_db_url(url: &str) -> Result<(), ValidationError> {
 
 impl AppConfig {
     pub fn from_env() -> Self {
-        // ดึงค่าจาก environment ด้วย std::env
         let app_env = env::var("APP_ENV").unwrap_or_else(|_| "development".to_string());
         let app_port = env::var("APP_PORT")
             .unwrap_or_else(|_| "8080".to_string())
@@ -35,6 +40,14 @@ impl AppConfig {
             app_env,
             app_port,
             database_url,
+            max_concurrent_pulls: env::var("MAX_CONCURRENT_PULLS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5),
+            per_registry_max: env::var("PER_REGISTRY_MAX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2),
         };
 
         cfg.validate().expect("❌ Invalid configuration values");

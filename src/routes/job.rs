@@ -111,136 +111,136 @@ pub async fn pull_image_and_record_metrics(
 
     let docker = Docker::connect_with_unix_defaults()
         .map_err(|e| anyhow::anyhow!("docker connect error: {e}"))?;
+    let result: anyhow::Result<(f64, u64, String)> = async {
+        let (registry_host, repo, _tag) = parse_image_ref(image);
+        let from_image = build_from_image(&registry_host, &repo);
+        let started = Instant::now();
+        let (repo, tag) = if let Some((r, t)) = image.split_once(':') {
+            (r.to_string(), t.to_string())
+        } else {
+            (image.to_string(), "latest".to_string())
+        };
 
-    let (registry_host, repo, _tag) = parse_image_ref(image);
+        let full_ref_with_host = format!("{}/{}:{}", registry_host, repo, tag);
+        let full_ref_repo_tag  = format!("{}:{}", repo, tag);
 
-    let from_image = build_from_image(&registry_host, &repo);
+        remove_image_if_exists(&docker, &full_ref_with_host).await;
+        remove_image_if_exists(&docker, &full_ref_repo_tag).await;
 
-    let started = Instant::now();
+        let opts = CreateImageOptions {
+            from_image: Some(from_image.clone()),
+            tag: Some(tag.clone()),
+            ..Default::default()
+        };
 
-    let (repo, tag) = if let Some((r, t)) = image.split_once(':') {
-        (r.to_string(), t.to_string())
-    } else {
-        (image.to_string(), "latest".to_string())
-    };
+        let mut first_byte_at: Option<Instant> = None;
+        let mut stream = docker.create_image(Some(opts), None, None);
 
-    let full_ref_with_host = format!("{}/{}:{}", registry_host, repo, tag);
-    let full_ref_repo_tag  = format!("{}:{}", repo, tag);
+        let mut layers: HashMap<String, (u64, u64)> = HashMap::new();
+        let mut logs = String::new();
 
-    remove_image_if_exists(&docker, &full_ref_with_host).await;
-    remove_image_if_exists(&docker, &full_ref_repo_tag).await;
-
-    let opts = CreateImageOptions {
-        from_image: Some(from_image.clone()),
-        tag: Some(tag.clone()),
-        ..Default::default()
-    };
-
-    let mut first_byte_at: Option<Instant> = None;
-    let mut stream = docker.create_image(Some(opts), None, None);
-
-    let mut layers: HashMap<String, (u64, u64)> = HashMap::new();
-    let mut logs = String::new();
-
-    while let Some(item) = stream.try_next().await? {
-        if let Some(status) = item.status {
-            logs.push_str(&status);
-            if let Some(id) = item.id.as_ref() {
-                logs.push_str(" [");
-                logs.push_str(id);
-                logs.push(']');
+        while let Some(item) = stream.try_next().await? {
+            if let Some(status) = item.status {
+                logs.push_str(&status);
+                if let Some(id) = item.id.as_ref() {
+                    logs.push_str(" [");
+                    logs.push_str(id);
+                    logs.push(']');
+                }
+                if let Some(progress) = item.progress {
+                    logs.push_str(" - ");
+                    logs.push_str(&progress);
+                }
+                logs.push('\n');
             }
-            if let Some(progress) = item.progress {
-                logs.push_str(" - ");
-                logs.push_str(&progress);
+
+            if let (Some(id), Some(detail)) = (item.id, item.progress_detail) {
+                let cur_u64 = detail.current.unwrap_or(0).max(0) as u64;
+                let tot_u64 = detail.total.unwrap_or(0).max(0) as u64;
+
+                if first_byte_at.is_none() && cur_u64 > 0 {
+                    first_byte_at = Some(Instant::now());
+                }
+
+                let entry = layers.entry(id).or_insert((0, 0));
+                if cur_u64 > entry.0 {
+                    entry.0 = cur_u64;
+                }
+                if tot_u64 > entry.1 {
+                    entry.1 = tot_u64;
+                }
             }
-            logs.push('\n');
         }
 
-        if let (Some(id), Some(detail)) = (item.id, item.progress_detail) {
-            let cur_u64 = detail.current.unwrap_or(0).max(0) as u64;
-            let tot_u64 = detail.total.unwrap_or(0).max(0) as u64;
+        let elapsed_ms = started.elapsed().as_millis() as f64;
+        let (sum_cur, sum_tot) = layers.values().fold((0u64, 0u64), |acc, &(c, t)| {
+            (acc.0.saturating_add(c), acc.1.saturating_add(t))
+        });
 
-            if first_byte_at.is_none() && cur_u64 > 0 {
-                first_byte_at = Some(Instant::now());
-            }
+        let bytes_downloaded = if sum_tot > 0 { sum_tot } else { sum_cur };
+        let inspected_size_bytes = docker
+            .inspect_image(image)
+            .await
+            .ok()
+            .and_then(|ins| ins.size)
+            .unwrap_or(0) as f64;
 
-            let entry = layers.entry(id).or_insert((0, 0));
-            if cur_u64 > entry.0 {
-                entry.0 = cur_u64;
-            }
-            if tot_u64 > entry.1 {
-                entry.1 = tot_u64;
-            }
+        let cache_hit = logs.contains("Image is up to date") || bytes_downloaded == 0;
+        let image_size_bytes = if inspected_size_bytes > 0.0 {
+            inspected_size_bytes
+        } else {
+            bytes_downloaded as f64
+        };
+
+        let download_elapsed_ms = if let Some(t0) = first_byte_at {
+            t0.elapsed().as_millis() as f64
+        } else {
+            0.0
+        };
+
+        let avg_speed_mbps = if bytes_downloaded > 0 && elapsed_ms > 0.0 {
+            ((bytes_downloaded as f64) * 8.0) / (elapsed_ms / 1000.0) / 1_000_000.0
+        } else {
+            0.0
+        };
+
+        db::insert_metric(pool, job_id, "download_time_ms", elapsed_ms, Some("ms")).await?;
+        db::insert_metric(pool, job_id, "image_size_bytes", image_size_bytes, Some("bytes")).await?;
+        db::insert_metric(pool, job_id, "bytes_downloaded_total", bytes_downloaded as f64, Some("bytes")).await?;
+        db::insert_metric(pool, job_id, "average_speed_mbps", avg_speed_mbps, Some("Mbps")).await?;
+        db::insert_metric(pool, job_id, "cache_hit", if cache_hit {1.0} else {0.0}, None).await?;
+
+        let labels = serde_json::json!({
+            "image": format!("{}:{}", repo, tag),
+            "registry_host": registry_host,
+            "layer_count": layers.len(),
+        }).to_string();
+
+        db::insert_metric_labeled(pool, job_id, "layers_observed", layers.len() as f64, None, Some(&labels)).await?;
+
+        Ok((elapsed_ms, bytes_downloaded, logs))
+    }
+    .await;
+
+    // handle success / failure
+    match result {
+        Ok((elapsed_ms, bytes_downloaded, logs)) => {
+            db::update_job_result(
+                pool,
+                job_id,
+                true,
+                Some(bytes_downloaded as i64),
+                Some(elapsed_ms as i64),
+                None,
+            ).await.ok();
+            db::complete_job(pool, job_id, Some(&logs)).await?;
+            Ok(())
+        }
+        Err(e) => {
+            let err_msg = format!("{:?}", e);
+            Err(anyhow::anyhow!("pull failed: {}", err_msg))
         }
     }
-
-    // Elapsed time in ms
-    let elapsed_ms = started.elapsed().as_millis() as f64;
-
-    // Sum across layers (fallback if inspect not available)
-    let (sum_cur, sum_tot) = layers.values().fold((0u64, 0u64), |acc, &(c, t)| {
-        (acc.0.saturating_add(c), acc.1.saturating_add(t))
-    });
-
-    let bytes_downloaded = if sum_tot > 0 { sum_tot } else { sum_cur };
-
-    // Try to inspect image for actual size (covers cache-hit cases)
-    let inspected_size_bytes = docker
-        .inspect_image(image)
-        .await
-        .ok()
-        .and_then(|ins| ins.size)
-        .unwrap_or(0) as f64;
-
-    // Determine cache hit (either log phrase or zero downloaded bytes)
-    let cache_hit = logs.contains("Image is up to date") || bytes_downloaded == 0;
-
-    // Prefer inspected size if we have it
-    let image_size_bytes = if inspected_size_bytes > 0.0 {
-        inspected_size_bytes
-    } else {
-        bytes_downloaded as f64
-    };
-
-    // Time to first byte in ms (or 0 if never started downloading)
-    let download_elapsed_ms = if let Some(t0) = first_byte_at {
-        let ms = t0.elapsed().as_millis() as f64;
-        ms
-    } else {
-        0.0
-    };
-
-    // Average speed in Mbps (only when real download happened)
-    let avg_speed_mbps = if bytes_downloaded > 0 && elapsed_ms > 0.0 {
-        ((bytes_downloaded as f64) * 8.0) / (elapsed_ms / 1000.0) / 1_000_000.0
-    } else {
-        0.0
-    };
-
-    // Store summary metrics (with units)
-    db::insert_metric(pool, job_id, "download_time_ms", elapsed_ms, Some("ms")).await?;
-    db::insert_metric(pool, job_id, "image_size_bytes", image_size_bytes, Some("bytes")).await?;
-    db::insert_metric(pool, job_id, "bytes_downloaded_total", bytes_downloaded as f64, Some("bytes")).await?;
-    db::insert_metric(pool, job_id, "image_size_reported_bytes", inspected_size_bytes, Some("bytes")).await?;
-    db::insert_metric(pool, job_id, "download_time_ms_actual", download_elapsed_ms, Some("ms")).await?;
-    db::insert_metric(pool, job_id, "average_speed_mbps", avg_speed_mbps, Some("Mbps")).await?;
-    db::insert_metric(pool, job_id, "cache_hit", if cache_hit {1.0} else {0.0}, None).await?;
-
-    // Labels for layers observed (fix registry_host/image formatting)
-    let labels = serde_json::json!({
-        "image": format!("{}:{}", repo, tag),
-        "registry_host": registry_host,
-        "layer_count": layers.len(),
-    }).to_string();
-
-
-    db::insert_metric_labeled(pool, job_id, "layers_observed", layers.len() as f64, None, Some(&labels)).await?;
-
-    // Finalize job status
-    db::complete_job(pool, job_id, Some(&logs)).await?;
-
-    Ok(())
 }
 
 // Remove the image (tag) if it already exists locally.

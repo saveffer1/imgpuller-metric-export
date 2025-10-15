@@ -143,6 +143,38 @@ pub async fn update_job_status(
     Ok(())
 }
 
+pub async fn update_job_result(
+    pool: &SqlitePool,
+    job_id: &str,
+    success: bool,
+    bytes: Option<i64>,
+    duration_ms: Option<i64>,
+    error_message: Option<String>,
+) -> sqlx::Result<()> {
+    let status = if success { "success" } else { "failed" };
+    let finished_at = chrono::Utc::now().timestamp();
+    let last_update_ts = finished_at;
+
+    sqlx::query(
+        r#"
+        UPDATE pull_jobs
+        SET status = ?, finished_at = ?, duration_ms = ?, bytes = ?, error_message = ?, last_update_ts = ?
+        WHERE id = ?
+        "#
+    )
+    .bind(status)
+    .bind(finished_at)
+    .bind(duration_ms)
+    .bind(bytes)
+    .bind(error_message)
+    .bind(last_update_ts)
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 pub async fn set_job_error(
     pool: &SqlitePool,
     id: &str,
