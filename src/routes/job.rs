@@ -5,8 +5,7 @@ use sqlx::SqlitePool;
 use crate::db;
 use crate::error::AppError;
 
-use bollard::query_parameters::CreateImageOptions;
-use bollard::image::RemoveImageOptions;
+use bollard::query_parameters::{CreateImageOptions, RemoveImageOptions};
 use bollard::Docker;
 use futures_util::TryStreamExt;
 use std::collections::HashMap;
