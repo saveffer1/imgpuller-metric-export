@@ -3,6 +3,7 @@ mod db;
 mod model;
 mod error;
 mod routes;
+mod worker;
 
 use actix_web::{get, web, App, HttpResponse, HttpServer, Responder};
 use actix_web::middleware::{Logger, NormalizePath, TrailingSlash};
@@ -83,6 +84,12 @@ async fn main() -> std::io::Result<()> {
     let pool = init_pool(&cfg.database_url)
         .await
         .expect("❌ Failed to initialize database");
+
+    let runner_pool = pool.clone();
+    tokio::spawn(async move {
+        // concurrency=2, lease_secs=300 (ปรับได้จาก config/env)
+        worker::run_job_runner(runner_pool, 2, 300).await;
+    });
 
     let addr = format!("0.0.0.0:{}", cfg.app_port);
 

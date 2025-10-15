@@ -2,10 +2,10 @@ use crate::model;
 use actix_web::{web, get, HttpResponse, Responder};
 use serde_json::json;
 
-mod job;
+pub mod job;
 pub use job::job_routes;
 
-mod metric;
+pub mod metric;
 pub use metric::metrics_routes;
 
 #[get("/health")]

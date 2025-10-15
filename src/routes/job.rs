@@ -40,15 +40,10 @@ async fn create_job(
     let job_id_resp = job_id.clone();
 
     // clones for the background task only
-    let pool_task = pool.clone();
-    let job_id_task = job_id.clone();
-    let image_task = image.clone();
+    // let pool_task = pool.clone();
+    // let job_id_task = job_id.clone();
+    // let image_task = image.clone();
 
-    tokio::spawn(async move {
-        if let Err(e) = pull_image_and_record_metrics(pool_task.clone(), job_id_task.clone(), image_task.clone()).await {
-            let _ = db::update_job_status(&pool_task, &job_id_task, "failed", Some(&format!("{e:#}"))).await;
-        }
-    });
 
     Ok(HttpResponse::Ok().json(JobResponse {
         success: true,
@@ -57,11 +52,13 @@ async fn create_job(
 }
 
 
-async fn pull_image_and_record_metrics(
-    pool: web::Data<SqlitePool>,
-    job_id: String,
-    image: String,
+// Make it public and take &SqlitePool so runner can call it.
+pub async fn pull_image_and_record_metrics(
+    pool: &SqlitePool,
+    job_id: &str,
+    image: &str,
 ) -> anyhow::Result<()> {
+
     let docker = Docker::connect_with_unix_defaults()
         .map_err(|e| anyhow::anyhow!("docker connect error: {e}"))?;
 
@@ -74,9 +71,15 @@ async fn pull_image_and_record_metrics(
 
     let started = Instant::now();
 
-    // bollard 0.19.3 query_parameters::CreateImageOptions
+    let (repo, tag) = if let Some((r, t)) = image.split_once(':') {
+        (r.to_string(), t.to_string())
+    } else {
+        (image.to_string(), "latest".to_string())
+    };
+
     let opts = CreateImageOptions {
-        from_image: Some(image.clone()),
+        from_image: Some(repo),
+        tag: Some(tag),
         ..Default::default()
     };
 
@@ -114,48 +117,58 @@ async fn pull_image_and_record_metrics(
         }
     }
 
+    // Elapsed time in ms
     let elapsed_ms = started.elapsed().as_millis() as f64;
+
+    // Sum across layers (fallback if inspect not available)
     let (sum_cur, sum_tot) = layers.values().fold((0u64, 0u64), |acc, &(c, t)| {
         (acc.0.saturating_add(c), acc.1.saturating_add(t))
     });
+
     let bytes_downloaded = if sum_tot > 0 { sum_tot } else { sum_cur };
 
-    let avg_speed_mbps = if elapsed_ms > 0.0 {
-        (bytes_downloaded as f64 * 8.0) / (elapsed_ms / 1000.0) / 1_000_000.0
+    // Try to inspect image for actual size (covers cache-hit cases)
+    let inspected_size_bytes = docker
+        .inspect_image(image)
+        .await
+        .ok()
+        .and_then(|ins| ins.size)
+        .unwrap_or(0) as f64;
+
+    // Determine cache hit (either log phrase or zero downloaded bytes)
+    let cache_hit = logs.contains("Image is up to date") || bytes_downloaded == 0;
+
+    // Prefer inspected size if we have it
+    let image_size_bytes = if inspected_size_bytes > 0.0 {
+        inspected_size_bytes
+    } else {
+        bytes_downloaded as f64
+    };
+
+    // Average speed in Mbps (only when real download happened)
+    let avg_speed_mbps = if !cache_hit && image_size_bytes > 0.0 && elapsed_ms > 0.0 {
+        (image_size_bytes * 8.0) / (elapsed_ms / 1000.0) / 1_000_000.0
     } else {
         0.0
     };
 
-    // store metrics (adjust db signatures if needed)
-    db::insert_metric(&pool, &job_id, "download_time_ms", elapsed_ms, None).await?;
-    db::insert_metric(
-        &pool,
-        &job_id,
-        "image_size_bytes",
-        bytes_downloaded as f64,
-        None,
-    )
-    .await?;
-    db::insert_metric(&pool, &job_id, "average_speed_mbps", avg_speed_mbps, None).await?;
+    // Store summary metrics (with units)
+    db::insert_metric(pool, job_id, "download_time_ms", elapsed_ms, Some("ms")).await?;
+    db::insert_metric(pool, job_id, "image_size_bytes", image_size_bytes, Some("bytes")).await?;
+    db::insert_metric(pool, job_id, "average_speed_mbps", avg_speed_mbps, Some("Mbps")).await?;
+    db::insert_metric(pool, job_id, "cache_hit", if cache_hit {1.0} else {0.0}, None).await?;
 
+    // Labels for layers observed (fix registry_host/image formatting)
     let labels = serde_json::json!({
         "image": image,
         "registry_host": registry_host,
         "layer_count": layers.len(),
-    })
-    .to_string();
+    }).to_string();
 
-    db::insert_metric_labeled(
-        &pool,
-        &job_id,
-        "layers_observed",
-        layers.len() as f64,
-        None,
-        Some(&labels),
-    )
-    .await?;
+    db::insert_metric_labeled(pool, job_id, "layers_observed", layers.len() as f64, None, Some(&labels)).await?;
 
-    db::update_job_status(&pool, &job_id, "completed", Some(&logs)).await?;
+    // Finalize job status
+    db::complete_job(pool, job_id, Some(&logs)).await?;
 
     Ok(())
 }

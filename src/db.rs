@@ -53,6 +53,33 @@ pub async fn init_pool(db_url: &str) -> Result<SqlitePool, sqlx::Error> {
         "#
     ).execute(&pool).await?;
 
+    // Add resilient columns if missing
+    async fn ensure_column(pool: &SqlitePool, table: &str, name: &str, def_sql: &str) -> Result<(), sqlx::Error> {
+        let cols: Vec<String> = sqlx::query(&format!("PRAGMA table_info({})", table))
+            .fetch_all(pool).await?
+            .into_iter()
+            .map(|r| r.get::<String, _>("name"))
+            .collect();
+
+        if !cols.iter().any(|c| c == name) {
+            let alter = format!("ALTER TABLE {} ADD COLUMN {}", table, def_sql);
+            sqlx::query(&alter).execute(pool).await?;
+        }
+        Ok(())
+    }
+
+    ensure_column(&pool, "jobs", "started_at",       "started_at TEXT").await?;
+    ensure_column(&pool, "jobs", "updated_at",       "updated_at TEXT").await?;
+    ensure_column(&pool, "jobs", "lease_expires_at", "lease_expires_at TEXT").await?;
+    ensure_column(&pool, "jobs", "last_heartbeat",   "last_heartbeat TEXT").await?;
+    ensure_column(&pool, "jobs", "max_attempts",     "max_attempts INTEGER NOT NULL DEFAULT 3").await?;
+    ensure_column(&pool, "jobs", "priority",         "priority INTEGER NOT NULL DEFAULT 0").await?;
+
+    // Helpful indexes
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)").execute(&pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_jobs_lease ON jobs(lease_expires_at)").execute(&pool).await?;
+
+
     // Metrics table (many rows per job, one per metric key)
     sqlx::query(
         r#"
@@ -254,6 +281,116 @@ pub async fn get_metrics_by_job(
             created_at: r.get("created_at"),
         })
         .collect())
+}
+
+
+// Atomically claim one job (queued or expired running) using an IMMEDIATE transaction.
+pub async fn claim_next_job(pool: &SqlitePool, lease_secs: i64) -> Result<Option<(String, String)>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    // pick next eligible job
+    let row = sqlx::query(
+        r#"
+        SELECT id, image
+          FROM jobs
+         WHERE status = 'queued'
+            OR (status = 'running' AND (lease_expires_at IS NULL OR lease_expires_at < datetime('now')))
+         ORDER BY priority DESC, created_at ASC
+         LIMIT 1
+        "#
+    ).fetch_optional(&mut *tx).await?;
+
+    if let Some(row) = row {
+        let id: String = row.get("id");
+        let image: String = row.get("image");
+
+        // mark as running + set lease
+        sqlx::query(
+            r#"
+            UPDATE jobs
+               SET status='running',
+                   started_at = COALESCE(started_at, datetime('now')),
+                   updated_at = datetime('now'),
+                   lease_expires_at = datetime('now', printf('+%d seconds', ?))
+             WHERE id = ?
+            "#
+        )
+        .bind(lease_secs)
+        .bind(&id)
+        .execute(&mut *tx).await?;
+
+        tx.commit().await?;
+        return Ok(Some((id, image)));
+    }
+
+    tx.commit().await?;
+    Ok(None)
+}
+
+// Extend lease / heartbeat
+pub async fn heartbeat_job(pool: &SqlitePool, job_id: &str, lease_secs: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE jobs
+           SET last_heartbeat = datetime('now'),
+               updated_at     = datetime('now'),
+               lease_expires_at = datetime('now', printf('+%d seconds', ?))
+         WHERE id = ?
+        "#
+    )
+    .bind(lease_secs)
+    .bind(job_id)
+    .execute(pool).await?;
+    Ok(())
+}
+
+// Mark a running job as completed
+pub async fn complete_job(pool: &SqlitePool, job_id: &str, result: Option<&str>) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE jobs
+           SET status='completed',
+               result=COALESCE(?, result),
+               updated_at=datetime('now'),
+               finished_at=datetime('now')
+         WHERE id=?
+        "#
+    ).bind(result).bind(job_id).execute(pool).await?;
+    Ok(())
+}
+
+// Mark as failed and increment retry_count
+pub async fn fail_job(pool: &SqlitePool, job_id: &str, err: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE jobs
+           SET status='failed',
+               error_detail=?,
+               updated_at=datetime('now'),
+               finished_at=datetime('now'),
+               retry_count = retry_count + 1
+         WHERE id=?
+        "#
+    ).bind(err).bind(job_id).execute(pool).await?;
+    Ok(())
+}
+
+// Recover stale running jobs (expired lease)
+pub async fn recover_stale_jobs(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
+    let res = sqlx::query(
+        r#"
+        UPDATE jobs
+           SET status='failed',
+               error_detail=COALESCE(error_detail, 'lease expired / worker died'),
+               updated_at=datetime('now'),
+               finished_at=datetime('now')
+         WHERE status='running'
+           AND lease_expires_at IS NOT NULL
+           AND lease_expires_at < datetime('now')
+        "#
+    ).execute(pool).await?;
+
+    Ok(res.rows_affected() as i64)
 }
 
 pub async fn list_recent_metrics(
