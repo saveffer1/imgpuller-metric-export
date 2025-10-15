@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 
 use crate::db;
+use crate::model::{ApiResponse, ErrorResponse};
 
 // -----------------------------
 // Public routes configurator
