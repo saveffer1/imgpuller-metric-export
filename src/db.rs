@@ -123,7 +123,7 @@ pub async fn update_job_status(
     pool: &SqlitePool,
     id: &str,
     status: &str,         // "queued" | "running" | "completed" | "failed"
-    result: Option<&str>, // optional summary/logs
+    result: Option<&str>, // สรุปสั้นๆ (ไม่ใช่ log ทั้งก้อน)
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
@@ -178,13 +178,12 @@ pub async fn update_job_result(
     Ok(())
 }
 
-#[allow(unused)]
 // Mark job as failed with error detail
 pub async fn set_job_error(
     pool: &SqlitePool,
     id: &str,
     error_detail: &str,
-    mark_failed: bool, // true ถ้าต้องการเปลี่ยนเป็น failed พร้อมปิดงาน
+    mark_failed: bool, // true = ปิดงานเลย
 ) -> Result<(), sqlx::Error> {
     if mark_failed {
         sqlx::query(

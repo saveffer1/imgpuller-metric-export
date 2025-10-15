@@ -62,16 +62,21 @@ pub async fn run_job_runner(
     );
 
     loop {
-        // NOTE: FIX — pass lease_secs as the 2nd argument to match db.rs signature
+        // claim_next_job ต้องรับ (pool, lease_secs)
         let claim = db::claim_next_job(&pool, lease_secs).await;
 
         match claim {
             Ok(Some((job_id, image))) => {
-                // Acquire a global permit (limit overall concurrency)
+                // Global concurrency gate
                 let Ok(global_permit) = global_sem.clone().acquire_owned().await else {
                     warn!("global semaphore closed; stopping runner loop");
                     break;
                 };
+
+                // mark job as running
+                if let Err(e) = db::update_job_status(&pool, &job_id, "running", None).await {
+                    warn!("job {}: cannot mark running: {:#}", job_id, e);
+                }
 
                 let pool_cloned = pool.clone();
                 let reg_map_cloned = reg_map.clone();
@@ -80,16 +85,13 @@ pub async fn run_job_runner(
                 let registry = parse_registry(&image);
                 let per_reg = per_registry_max;
 
-                if let Err(e) = db::update_job_status(&pool, &job_id, "running", /* started_at */ None).await {
-                    warn!("job {}: cannot mark running: {:#}", job_id, e);
-                }
-
                 tokio::spawn(async move {
-                    // Acquire per-registry slot
+                    // Per-registry concurrency gate
                     let reg_sem = get_or_create_reg_sem(&reg_map_cloned, &registry, per_reg).await;
                     let Ok(_reg_permit) = reg_sem.acquire_owned().await else {
                         warn!("registry semaphore closed for {}; job {}", registry, job_id);
-                        let _ = db::fail_job(&pool_cloned, &job_id, "registry semaphore closed").await;
+                        // บันทึก error_detail แล้วปิดงาน
+                        let _ = db::set_job_error(&pool_cloned, &job_id, "registry semaphore closed", true).await;
                         drop(global_permit);
                         return;
                     };
@@ -104,24 +106,21 @@ pub async fn run_job_runner(
                     let hb_interval = Duration::from_secs((lease_secs / 2).max(1) as u64);
                     let (hb_tx, mut hb_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
-                    // heartbeat task
                     let hb_handle = tokio::spawn(async move {
                         loop {
                             tokio::select! {
                                 _ = sleep(hb_interval) => {
                                     if let Err(e) = db::heartbeat_job(&hb_pool, &hb_job, lease_secs).await {
                                         warn!("job {}: heartbeat failed: {:#}", hb_job, e);
-                                        // ถ้า heartbeat ล้มเหลว อาจจะลองต่ออายุอีก 1-2 ครั้ง หรือตัดสินใจหยุด
                                     }
                                 }
                                 _ = hb_rx.recv() => {
-                                    break; // stop heartbeat when job ends
+                                    break;
                                 }
                             }
                         }
                     });
 
-                    // Actual pull (success path completes the job inside this function)
                     let pull_res = job::pull_image_and_record_metrics(&pool_cloned, &job_id, &image).await;
 
                     let _ = hb_tx.send(());
@@ -130,16 +129,13 @@ pub async fn run_job_runner(
                     match pull_res {
                         Ok(()) => {
                             info!("job {}: completed successfully", job_id);
-                            // Do NOT complete here again to avoid double-marking.
                         }
                         Err(e) => {
                             error!("job {}: failed: {:#}", job_id, e);
-                            // Worker marks failed with detailed error message
-                            let _ = db::fail_job(&pool_cloned, &job_id, &format!("{:#}", e)).await;
+                            let _ = db::set_job_error(&pool_cloned, &job_id, &format!("{:#}", e), true).await;
                         }
                     }
 
-                    // When this task ends, both permits (global + per-registry) drop automatically.
                     drop(global_permit);
                 });
             }
