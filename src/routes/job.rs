@@ -6,6 +6,7 @@ use crate::db;
 use crate::error::AppError;
 
 use bollard::query_parameters::CreateImageOptions;
+use bollard::image::RemoveImageOptions;
 use bollard::Docker;
 use futures_util::TryStreamExt;
 use std::collections::HashMap;
@@ -42,8 +43,7 @@ async fn create_job(
     // clones for the background task only
     // let pool_task = pool.clone();
     // let job_id_task = job_id.clone();
-    // let image_task = image.clone();
-
+    // let image_task = image.clone(
 
     Ok(HttpResponse::Ok().json(JobResponse {
         success: true,
@@ -76,6 +76,10 @@ pub async fn pull_image_and_record_metrics(
     } else {
         (image.to_string(), "latest".to_string())
     };
+
+    let full_ref = format!("{}:{}", repo, tag);
+
+    remove_image_if_exists(&docker, &full_ref).await;
 
     let opts = CreateImageOptions {
         from_image: Some(repo),
@@ -146,8 +150,8 @@ pub async fn pull_image_and_record_metrics(
     };
 
     // Average speed in Mbps (only when real download happened)
-    let avg_speed_mbps = if !cache_hit && image_size_bytes > 0.0 && elapsed_ms > 0.0 {
-        (image_size_bytes * 8.0) / (elapsed_ms / 1000.0) / 1_000_000.0
+    let avg_speed_mbps = if bytes_downloaded > 0 && elapsed_ms > 0.0 {
+        ((bytes_downloaded as f64) * 8.0) / (elapsed_ms / 1000.0) / 1_000_000.0
     } else {
         0.0
     };
@@ -155,6 +159,8 @@ pub async fn pull_image_and_record_metrics(
     // Store summary metrics (with units)
     db::insert_metric(pool, job_id, "download_time_ms", elapsed_ms, Some("ms")).await?;
     db::insert_metric(pool, job_id, "image_size_bytes", image_size_bytes, Some("bytes")).await?;
+    db::insert_metric(pool, job_id, "bytes_downloaded_total", bytes_downloaded as f64, Some("bytes")).await?;
+    db::insert_metric(pool, job_id, "image_size_reported_bytes", inspected_size_bytes, Some("bytes")).await?;
     db::insert_metric(pool, job_id, "average_speed_mbps", avg_speed_mbps, Some("Mbps")).await?;
     db::insert_metric(pool, job_id, "cache_hit", if cache_hit {1.0} else {0.0}, None).await?;
 
@@ -171,6 +177,21 @@ pub async fn pull_image_and_record_metrics(
     db::complete_job(pool, job_id, Some(&logs)).await?;
 
     Ok(())
+}
+
+// Remove the image (tag) if it already exists locally.
+// This forces a real network download on the next pull.
+// Ignore errors intentionally to be best-effort.
+async fn remove_image_if_exists(docker: &Docker, full_ref: &str) {
+    if docker.inspect_image(full_ref).await.is_ok() {
+        let _ = docker
+            .remove_image(
+                full_ref,
+                Some(RemoveImageOptions { force: true, noprune: false }),
+                None,
+            )
+            .await;
+    }
 }
 
 #[get("/jobs")]
