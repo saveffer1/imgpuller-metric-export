@@ -1,48 +1,35 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use actix_web::{get, post, web, HttpResponse, Responder};
+use actix_web::{get, post, web, HttpResponse};
 use bollard::query_parameters::{CreateImageOptions, RemoveImageOptions};
 use bollard::Docker;
 use futures_util::TryStreamExt;
 use log::warn;
-use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool};
+use serde::Deserialize;
+use sqlx::SqlitePool;
 
 use crate::db;
-use crate::model::{ApiResponse, ErrorResponse};
+use crate::error::AppError;
+use crate::model::ApiResponse;
 
-// -----------------------------
-// Public routes configurator
-// -----------------------------
 pub fn job_routes(cfg: &mut web::ServiceConfig) {
-    cfg.service(create_job)
-        .service(list_jobs)
-        .service(get_job);
+    cfg.service(create_job).service(list_jobs).service(get_job);
 }
 
-// -----------------------------
-// Request/Response types
-// -----------------------------
 #[derive(Deserialize)]
 pub struct CreateJobRequest {
     pub image: String,
 }
 
-#[derive(Serialize)]
-struct ApiResp<T> {
-    success: bool,
-    data: T,
-}
-
-#[derive(Serialize)]
+#[derive(serde::Serialize)]
 struct JobListItem {
     id: String,
     image: String,
     status: String,
 }
 
-#[derive(Serialize)]
+#[derive(serde::Serialize)]
 struct JobDetail {
     id: String,
     image: String,
@@ -54,119 +41,75 @@ struct JobDetail {
     finished_at: Option<String>,
 }
 
-// -----------------------------
-// Routes
-// -----------------------------
-
 #[post("/jobs")]
 pub async fn create_job(
     pool: web::Data<SqlitePool>,
     body: web::Json<CreateJobRequest>,
-) -> actix_web::Result<impl Responder> {
+) -> Result<HttpResponse, AppError> {
     let image = body.image.trim();
     if image.is_empty() {
-        return Ok(HttpResponse::BadRequest().body("image is required"));
+        return Err(AppError::bad_request("image is required"));
     }
 
-    // Cargo.toml: uuid = { version = "1", features = ["v4"] }
     let id = uuid::Uuid::new_v4().to_string();
+    db::insert_job(pool.get_ref(), &id, image).await.map_err(AppError::from)?;
 
-    sqlx::query(
-        r#"
-        INSERT INTO jobs (id, image, status)
-        VALUES (?, ?, 'queued')
-        "#,
-    )
-    .bind(&id)
-    .bind(image)
-    .execute(pool.get_ref())
-    .await
-    .map_err(actix_web::error::ErrorInternalServerError)?;
-
-    let resp = ApiResp {
-        success: true,
-        data: JobListItem {
+    Ok(HttpResponse::Ok().json(ApiResponse::ok(
+        "job created",
+        JobListItem {
             id,
             image: image.to_string(),
             status: "queued".to_string(),
         },
-    };
-    Ok(HttpResponse::Ok().json(resp))
+    )))
 }
 
 #[get("/jobs")]
-pub async fn list_jobs(pool: web::Data<SqlitePool>) -> actix_web::Result<impl Responder> {
-    let rows = sqlx::query(
-        r#"
-        SELECT id, image, status
-          FROM jobs
-      ORDER BY created_at DESC
-        "#,
-    )
-    .fetch_all(pool.get_ref())
-    .await
-    .map_err(actix_web::error::ErrorInternalServerError)?;
+pub async fn list_jobs(pool: web::Data<SqlitePool>) -> Result<HttpResponse, AppError> {
+    let rows = db::list_jobs(pool.get_ref()).await.map_err(AppError::from)?;
+    let data: Vec<JobListItem> = rows
+        .into_iter()
+        .map(|r| JobListItem {
+            id: r.id,
+            image: r.image,
+            status: r.status,
+        })
+        .collect();
 
-    let mut items = Vec::with_capacity(rows.len());
-    for r in rows {
-        items.push(JobListItem {
-            id: r.get::<String, _>("id"),
-            image: r.get::<String, _>("image"),
-            status: r.get::<String, _>("status"),
-        });
-    }
-
-    Ok(HttpResponse::Ok().json(ApiResp { success: true, data: items }))
+    Ok(HttpResponse::Ok().json(ApiResponse::ok("ok", data)))
 }
 
 #[get("/jobs/{id}")]
 pub async fn get_job(
     path: web::Path<String>,
     pool: web::Data<SqlitePool>,
-) -> actix_web::Result<impl Responder> {
+) -> Result<HttpResponse, AppError> {
     let id = path.into_inner();
 
-    let row_opt = sqlx::query(
-        r#"
-        SELECT id, image, status, result, error_detail, retry_count, created_at, finished_at
-          FROM jobs
-         WHERE id = ?
-        "#,
-    )
-    .bind(&id)
-    .fetch_optional(pool.get_ref())
-    .await
-    .map_err(actix_web::error::ErrorInternalServerError)?;
+    let row = db::get_job_by_id(pool.get_ref(), &id)
+        .await
+        .map_err(AppError::from)?;
 
-    match row_opt {
-        None => Ok(HttpResponse::NotFound().body("Job not found")),
-        Some(r) => {
-            let result_raw: Option<String> = r.get::<Option<String>, _>("result");
-            let result_short = result_raw.map(|s| truncate(&s, 500));
+    let Some(r) = row else {
+        return Err(AppError::not_found("job not found"));
+    };
 
-            let detail = JobDetail {
-                id: r.get::<String, _>("id"),
-                image: r.get::<String, _>("image"),
-                status: r.get::<String, _>("status"),
-                result: result_short,
-                error_detail: r.get::<Option<String>, _>("error_detail"),
-                retry_count: r.get::<i64, _>("retry_count"),
-                created_at: r.get::<String, _>("created_at"),
-                finished_at: r.get::<Option<String>, _>("finished_at"),
-            };
+    let result_short = r.result.as_ref().map(|s| truncate(s, 500));
+    let detail = JobDetail {
+        id: r.id,
+        image: r.image,
+        status: r.status,
+        result: result_short,
+        error_detail: r.error_detail,
+        retry_count: r.retry_count,
+        created_at: r.created_at,
+        finished_at: r.finished_at,
+    };
 
-            Ok(HttpResponse::Ok().json(ApiResp { success: true, data: detail }))
-        }
-    }
+    Ok(HttpResponse::Ok().json(ApiResponse::ok("ok", detail)))
 }
 
-// -----------------------------
-// Worker-facing function
-// -----------------------------
-
 /// Called by worker to pull image and record metrics.
-/// Success: write short summary to jobs.result and set status='completed'.
-/// Failure: return Err so worker can call db::set_job_error(..., true).
 pub async fn pull_image_and_record_metrics(
     pool: &SqlitePool,
     job_id: &str,
@@ -175,12 +118,12 @@ pub async fn pull_image_and_record_metrics(
     let docker = Docker::connect_with_unix_defaults()
         .map_err(|e| anyhow::anyhow!("docker connect error: {e}"))?;
 
-    let (registry_host, _repo_from_parse, _tag_from_parse) = parse_image_ref(image);
+    let (registry_host, _, _) = parse_image_ref(image);
     let (repo, tag) = split_repo_tag(image);
     let full_ref_repo_tag = format!("{}:{}", repo, tag);
 
-    // pre-clean (ignore if absent)
-    remove_image_if_exists(&docker, &format!("{}/{}", registry_host, full_ref_repo_tag)).await;
+    // Pre-clean (ignore missing)
+    remove_image_if_exists(&docker, &format!("{}/{}", registry_host, &full_ref_repo_tag)).await;
     remove_image_if_exists(&docker, &full_ref_repo_tag).await;
 
     let from_image = build_from_image(&registry_host, &repo);
@@ -266,7 +209,7 @@ pub async fn pull_image_and_record_metrics(
         0.0
     };
 
-    // metrics (separate table)
+    // metrics
     db::insert_metric(pool, job_id, "download_time_ms", elapsed_ms, Some("ms")).await?;
     db::insert_metric(pool, job_id, "image_size_bytes", image_size_bytes, Some("bytes")).await?;
     db::insert_metric(pool, job_id, "bytes_downloaded_total", bytes_downloaded as f64, Some("bytes")).await?;
@@ -283,7 +226,6 @@ pub async fn pull_image_and_record_metrics(
     .to_string();
     db::insert_metric_labeled(pool, job_id, "layers_observed", layers.len() as f64, None, Some(&labels)).await?;
 
-    // short summary (no long logs)
     let digest_str = digest.as_deref().unwrap_or("-");
     let summary = format!(
         "Pulled {} from {} • size ~{:.1} MB • layers {} • cache_hit={} • digest {}",
@@ -295,14 +237,12 @@ pub async fn pull_image_and_record_metrics(
         digest_str
     );
 
-    db::update_job_status(pool, job_id, "completed", Some(&summary)).await?;
+    db::complete_job(pool, job_id, Some(&summary)).await?;
 
     Ok(())
 }
 
-// -----------------------------
-// Helpers
-// -----------------------------
+// -------------- helpers --------------
 
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
@@ -314,7 +254,6 @@ fn truncate(s: &str, max: usize) -> String {
 
 fn parse_image_ref(image: &str) -> (String, String, String) {
     let mut parts = image.split('/');
-
     let first = parts.next().unwrap_or("");
     let (registry_host, remainder) = if first.contains('.') || first.contains(':') || first == "localhost" {
         (first.to_string(), parts.collect::<Vec<_>>().join("/"))
@@ -329,7 +268,6 @@ fn parse_image_ref(image: &str) -> (String, String, String) {
             }
         })
     };
-
     let (repo, tag) = split_repo_tag(&remainder);
     (registry_host, repo, tag)
 }
@@ -343,11 +281,7 @@ fn split_repo_tag(image: &str) -> (String, String) {
 }
 
 async fn remove_image_if_exists(docker: &Docker, name: &str) {
-    let opts = Some(RemoveImageOptions {
-        force: true,
-        noprune: false,
-    });
-
+    let opts = Some(RemoveImageOptions { force: true, noprune: false });
     if let Err(e) = docker.remove_image(name, opts, None).await {
         #[cfg(debug_assertions)]
         warn!("remove_image_if_exists({}): {}", name, e);

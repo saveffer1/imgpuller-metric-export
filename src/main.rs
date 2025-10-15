@@ -10,9 +10,10 @@ use actix_web::{get, web, App, HttpResponse, HttpServer, Responder};
 use actix_web::middleware::{Logger, NormalizePath, TrailingSlash};
 use tokio::sync::{Mutex, Semaphore};
 use clap::Parser;
-use config::AppConfig;
-use db::init_pool;
 use log::info;
+
+use crate::config::AppConfig;
+use crate::db::{init_pool, init_db};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -20,9 +21,11 @@ pub struct AppState {
     pub global_pull_sem: Arc<Semaphore>,
     pub registry_sems: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
 }
+
 #[derive(Parser, Debug)]
 #[command(name = "imgpuller-metric-export", version, about = "Actix + SQLx metric exporter")]
 struct CliArgs {
+    /// Initialize (create/reset) database schema and exit.
     #[arg(long)]
     init_db: bool,
 }
@@ -66,63 +69,94 @@ async fn not_found() -> impl Responder {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
+
     let args = CliArgs::parse();
     let cfg = AppConfig::from_env();
+    info!("🔧 Configuration: {:?}", cfg);
 
+    // --init-db mode: เตรียมไฟล์/ไดเรกทอรี แล้วสร้างตาราง จากนั้นออกเลย
+    if args.init_db {
+        info!("--init-db with DATABASE_URL = {}", cfg.database_url);
+
+        // รองรับเฉพาะไฟล์ (sqlite://...) ถ้าเป็น sqlite::memory: จะข้ามส่วนจัดการไฟล์
+        if let Some(path_str) = cfg.database_url.strip_prefix("sqlite://") {
+            let path = std::path::Path::new(path_str);
+
+            // สร้างโฟลเดอร์เฉพาะกรณีมี parent และไม่ว่าง
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() && !parent.exists() {
+                    info!("📁 Creating directory for database: {}", parent.display());
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        eprintln!("❌ Failed to create directory {}: {e}", parent.display());
+                        return Ok(());
+                    }
+                }
+            }
+
+            // ลบไฟล์เดิม (ถ้ามี) ในตำแหน่ง relative เดิม (ไม่เติม '/')
+            if path.exists() {
+                info!("🗑️ Removing existing database file: {}", path.display());
+                if let Err(e) = std::fs::remove_file(path) {
+                    eprintln!("❌ Failed to remove old DB file {}: {e}", path.display());
+                    return Ok(());
+                }
+            }
+
+            info!("🆕 Creating new database file at {}", path.display());
+        } else {
+            info!("⚠️ --init-db works only with sqlite:// URLs (current: {})", cfg.database_url);
+        }
+
+        // สร้าง pool แล้ว init schema (แสดง error แทน panic)
+        match init_pool(&cfg.database_url).await {
+            Ok(pool) => {
+                match init_db(&pool).await {
+                    Ok(()) => {
+                        info!("✅ Database schema initialized. Exiting per --init-db.");
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Failed to initialize database schema: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("❌ Failed to initialize database (pool): {e}");
+            }
+        }
+
+        return Ok(());
+    }
+    
+    // normal server mode
+    let pool = init_pool(&cfg.database_url)
+        .await
+        .expect("❌ Failed to initialize database");
+
+    // เตรียม AppState
     let app_state = AppState {
         global_pull_sem: Arc::new(Semaphore::new(cfg.max_concurrent_pulls)),
         registry_sems: Arc::new(Mutex::new(HashMap::new())),
         config: cfg.clone(),
     };
 
-    if args.init_db {
-        if let Some(path_str) = cfg.database_url.strip_prefix("sqlite://") {
-            let mut path_str = path_str.to_string();
-            if !path_str.starts_with('/') {
-                path_str = format!("/{}", path_str);
-            }
-            let path = std::path::Path::new(&path_str);
+    // ค่าไว้ใช้ใน worker โดยไม่จับ cfg ทั้งก้อน (กัน move)
+    let max_concurrent_pulls = cfg.max_concurrent_pulls;
+    let per_registry_max = cfg.per_registry_max;
 
-            if let Some(parent) = path.parent() {
-                if !parent.exists() {
-                    info!("📁 Creating directory for database: {}", parent.display());
-                    std::fs::create_dir_all(parent)
-                        .expect("❌ Failed to create directory for SQLite database");
-                }
-            }
-
-            if path.exists() {
-                info!("🗑️ Removing existing database file: {}", path.display());
-                std::fs::remove_file(path)
-                    .expect("❌ Failed to remove old DB file");
-            }
-
-            info!("🆕 Creating new database...");
-        } else {
-            info!("⚠️ --init-db works only with sqlite:// URLs");
-        }
-    }
-
-    info!("🔧 Configuration: {:?}", cfg);
-
-    let pool = init_pool(&cfg.database_url)
-        .await
-        .expect("❌ Failed to initialize database");
-
+    // start worker
     let runner_pool = pool.clone();
-        tokio::spawn(async move {
+    tokio::spawn(async move {
         worker::run_job_runner(
-            runner_pool,                  // database pool
-            cfg.max_concurrent_pulls,     // global semaphore
-            cfg.per_registry_max,         // per registry semaphore
-            300,                          // lease time in seconds
+            runner_pool,
+            max_concurrent_pulls,
+            per_registry_max,
+            300, // lease time (secs)
         )
         .await;
     });
 
     let addr = format!("0.0.0.0:{}", cfg.app_port);
-
-    env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
     info!("🚀 Server running at http://{addr}");
 
     HttpServer::new(move || {

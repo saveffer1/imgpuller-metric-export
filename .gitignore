@@ -1,6 +1,7 @@
 # Rust/Cargo specific ignores
 .env
 exportor.db
+exportor.db*
 
 .DS_Store
 
