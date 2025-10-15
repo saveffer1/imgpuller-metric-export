@@ -204,6 +204,8 @@ pub async fn pull_image_and_record_metrics(
             0.0
         };
 
+        // Record metrics
+        db::insert_metric(pool, job_id, "time_to_first_byte_ms", download_elapsed_ms, Some("ms")).await?;
         db::insert_metric(pool, job_id, "download_time_ms", elapsed_ms, Some("ms")).await?;
         db::insert_metric(pool, job_id, "image_size_bytes", image_size_bytes, Some("bytes")).await?;
         db::insert_metric(pool, job_id, "bytes_downloaded_total", bytes_downloaded as f64, Some("bytes")).await?;

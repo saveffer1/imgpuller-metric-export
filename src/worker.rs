@@ -80,6 +80,10 @@ pub async fn run_job_runner(
                 let registry = parse_registry(&image);
                 let per_reg = per_registry_max;
 
+                if let Err(e) = db::update_job_status(&pool, &job_id, "running", /* started_at */ None).await {
+                    warn!("job {}: cannot mark running: {:#}", job_id, e);
+                }
+
                 tokio::spawn(async move {
                     // Acquire per-registry slot
                     let reg_sem = get_or_create_reg_sem(&reg_map_cloned, &registry, per_reg).await;
@@ -95,8 +99,33 @@ pub async fn run_job_runner(
                         job_id, image, registry
                     );
 
+                    let hb_pool = pool_cloned.clone();
+                    let hb_job = job_id.clone();
+                    let hb_interval = Duration::from_secs((lease_secs / 2).max(1) as u64);
+                    let (hb_tx, mut hb_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+                    // heartbeat task
+                    let hb_handle = tokio::spawn(async move {
+                        loop {
+                            tokio::select! {
+                                _ = sleep(hb_interval) => {
+                                    if let Err(e) = db::heartbeat_job(&hb_pool, &hb_job, lease_secs).await {
+                                        warn!("job {}: heartbeat failed: {:#}", hb_job, e);
+                                        // ถ้า heartbeat ล้มเหลว อาจจะลองต่ออายุอีก 1-2 ครั้ง หรือตัดสินใจหยุด
+                                    }
+                                }
+                                _ = hb_rx.recv() => {
+                                    break; // stop heartbeat when job ends
+                                }
+                            }
+                        }
+                    });
+
                     // Actual pull (success path completes the job inside this function)
                     let pull_res = job::pull_image_and_record_metrics(&pool_cloned, &job_id, &image).await;
+
+                    let _ = hb_tx.send(());
+                    let _ = hb_handle.await;
 
                     match pull_res {
                         Ok(()) => {

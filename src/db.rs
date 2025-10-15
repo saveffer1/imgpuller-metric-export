@@ -175,6 +175,8 @@ pub async fn update_job_result(
     Ok(())
 }
 
+#[allow(unused)]
+// Mark job as failed with error detail
 pub async fn set_job_error(
     pool: &SqlitePool,
     id: &str,
@@ -407,7 +409,8 @@ pub async fn fail_job(pool: &SqlitePool, job_id: &str, err: &str) -> Result<(), 
     Ok(())
 }
 
-// Recover stale running jobs (expired lease)
+#[allow(unused)]
+// Recover jobs that have been running but whose lease has expired
 pub async fn recover_stale_jobs(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
     let res = sqlx::query(
         r#"
