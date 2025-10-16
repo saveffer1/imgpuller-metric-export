@@ -6,6 +6,9 @@ docker compose build --no-cache
 
 ## run
 
+### copy env
+cp .env.example .env
+
 ### first time
 docker compose run --rm imgpuller --init-db
 
