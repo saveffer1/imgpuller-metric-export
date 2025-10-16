@@ -109,7 +109,8 @@ pub async fn get_job(
     Ok(HttpResponse::Ok().json(ApiResponse::ok("ok", detail)))
 }
 
-/// Called by worker to pull image and record metrics.
+/// Worker entrypoint: pull image and record metrics.
+/// Performs optional pre/post removal for cold-pull benchmarking.
 pub async fn pull_image_and_record_metrics(
     pool: &SqlitePool,
     job_id: &str,
@@ -122,9 +123,14 @@ pub async fn pull_image_and_record_metrics(
     let (repo, tag) = split_repo_tag(image);
     let full_ref_repo_tag = format!("{}:{}", repo, tag);
 
-    // Pre-clean (ignore missing)
-    remove_image_if_exists(&docker, &format!("{}/{}", registry_host, &full_ref_repo_tag)).await;
-    remove_image_if_exists(&docker, &full_ref_repo_tag).await;
+    // -------- optional pre-removal (cold start) --------
+    if env_flag("PRE_PULL_REMOVE", true) {
+        remove_image_thorough(&docker, &repo, &tag, &registry_host).await;
+    } else {
+        // best-effort quick cleanup
+        remove_image_if_exists(&docker, &format!("{}/{}", registry_host, &full_ref_repo_tag)).await;
+        remove_image_if_exists(&docker, &full_ref_repo_tag).await;
+    }
 
     let from_image = build_from_image(&registry_host, &repo);
     let started = Instant::now();
@@ -239,6 +245,11 @@ pub async fn pull_image_and_record_metrics(
 
     db::complete_job(pool, job_id, Some(&summary)).await?;
 
+    // -------- optional post-removal (stateless runner) --------
+    if env_flag("POST_PULL_REMOVE", true) {
+        remove_image_thorough(&docker, &repo, &tag, &registry_host).await;
+    }
+
     Ok(())
 }
 
@@ -285,6 +296,55 @@ async fn remove_image_if_exists(docker: &Docker, name: &str) {
     if let Err(e) = docker.remove_image(name, opts, None).await {
         #[cfg(debug_assertions)]
         warn!("remove_image_if_exists({}): {}", name, e);
+    }
+}
+
+// env helpers
+
+fn env_flag(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "on" | "On" | "ON"),
+        Err(_) => default,
+    }
+}
+
+async fn rm_image(docker: &Docker, name: &str) {
+    let opts = Some(RemoveImageOptions { force: true, noprune: false });
+    if let Err(e) = docker.remove_image(name, opts, None).await {
+        #[cfg(debug_assertions)]
+        warn!("remove_image({}): {}", name, e);
+    }
+}
+
+/// Thorough removal: try short ref, full ref, then remove by id/tags/digests from inspect.
+async fn remove_image_thorough(docker: &Docker, repo: &str, tag: &str, registry_host: &str) {
+    let short_ref = format!("{}:{}", repo, tag);
+    let full_ref  = format!("{}/{}", registry_host, &short_ref);
+
+    // ลบแบบรวดเร็วทั้งชื่อสั้น/ชื่อเต็มก่อน
+    rm_image(docker, &short_ref).await;
+    rm_image(docker, &full_ref).await;
+
+    // แก้จุดพัง: ห้าม await ใน .or_else() -> ใช้ match แทน
+    let inspected = match docker.inspect_image(&short_ref).await {
+        Ok(ins) => Ok(ins),
+        Err(_)  => docker.inspect_image(&full_ref).await,
+    };
+
+    if let Ok(ins) = inspected {
+        if let Some(id) = ins.id {
+            rm_image(docker, &id).await;
+        }
+        if let Some(tags) = ins.repo_tags {
+            for t in tags {
+                rm_image(docker, &t).await;
+            }
+        }
+        if let Some(digests) = ins.repo_digests {
+            for d in digests {
+                rm_image(docker, &d).await;
+            }
+        }
     }
 }
 

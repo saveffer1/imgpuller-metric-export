@@ -1,0 +1,34 @@
+services:
+  imgpuller:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: imgpuller:latest
+    env_file:
+      - .env
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      APP_PORT: ${APP_PORT:-5555}
+      DATABASE_URL: ${DATABASE_URL:-sqlite://data/exportor.db}
+      MAX_CONCURRENT_PULLS: ${MAX_CONCURRENT_PULLS:-5}
+      PER_REGISTRY_MAX: ${PER_REGISTRY_MAX:-2}
+      RUST_LOG: ${RUST_LOG:-info}
+      PRE_PULL_REMOVE: "true"
+      POST_PULL_REMOVE: "true"
+      # DOCKER_HOST: "unix:///var/run/docker.sock"
+
+    ports:
+      - "${APP_PORT:-5555}:${APP_PORT:-5555}"
+
+    volumes:
+      - ./data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${APP_PORT:-5555}/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+    restart: unless-stopped
